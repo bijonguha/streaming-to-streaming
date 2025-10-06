@@ -1,4 +1,5 @@
 # 🌐 Real-time Streaming Translation Pipeline
+![Demo Screenshot](demo.gif)
 
 A FastAPI application that chains two streaming REST APIs to provide real-time translation. The first API generates text, and the second API translates it sentence-by-sentence as it streams - no waiting for the entire text to complete!
 
