@@ -1,26 +1,87 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 import httpx
 import json
 import asyncio
 from typing import Optional
+import time
+from collections import defaultdict
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Real-time Translation Pipeline")
 
-OPENAI_API_KEY = 'enter-your-key'
+OPENAI_API_KEY = 'your-api-key-here'
+
+# Configuration for production
+MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent API calls
+REQUEST_TIMEOUT = 120  # Timeout in seconds
+MAX_REQUESTS_PER_MINUTE = 60  # Rate limiting per IP
+
+# Semaphore to limit concurrent OpenAI API calls
+api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+# Rate limiting tracking
+rate_limit_tracker = defaultdict(list)
+
+# Shared HTTP client with connection pooling
+http_client = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize shared HTTP client on startup"""
+    global http_client
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
+    http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+    logger.info("Application started with connection pooling")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close HTTP client on shutdown"""
+    global http_client
+    if http_client:
+        await http_client.aclose()
+    logger.info("Application shutdown complete")
 
 
 class TranslationRequest(BaseModel):
     prompt: str
-    language: str = "Hindi"
+    language: str = "Spanish"
 
 
-async def stream_api1(prompt: str, queue: asyncio.Queue):
-    """Producer: Stream from first API and put chunks in queue"""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
+def check_rate_limit(client_ip: str) -> bool:
+    """Simple rate limiting per IP"""
+    current_time = time.time()
+    
+    # Clean old entries (older than 1 minute)
+    rate_limit_tracker[client_ip] = [
+        timestamp for timestamp in rate_limit_tracker[client_ip]
+        if current_time - timestamp < 60
+    ]
+    
+    # Check if limit exceeded
+    if len(rate_limit_tracker[client_ip]) >= MAX_REQUESTS_PER_MINUTE:
+        return False
+    
+    # Add current request
+    rate_limit_tracker[client_ip].append(current_time)
+    return True
+
+
+async def stream_api1(prompt: str, queue: asyncio.Queue, request_id: str):
+    """Producer: Stream from first API with semaphore control"""
+    async with api_semaphore:  # Limit concurrent API calls
+        try:
+            logger.info(f"[{request_id}] Starting API1 stream")
+            
+            async with http_client.stream(
                 'POST',
                 'https://api.openai.com/v1/chat/completions',
                 headers={
@@ -30,10 +91,13 @@ async def stream_api1(prompt: str, queue: asyncio.Queue):
                 json={
                     'model': 'gpt-4',
                     'messages': [{'role': 'user', 'content': prompt}],
-                    'stream': True
+                    'stream': True,
+                    'max_tokens': 500  # Limit to control costs
                 }
             ) as response:
                 if response.status_code != 200:
+                    error_text = await response.aread()
+                    logger.error(f"[{request_id}] API1 failed: {response.status_code}")
                     await queue.put({'error': f'API 1 failed: {response.status_code}'})
                     await queue.put(None)
                     return
@@ -45,7 +109,6 @@ async def stream_api1(prompt: str, queue: asyncio.Queue):
                         data = line[6:]
                         
                         if data == '[DONE]':
-                            # Send remaining buffer
                             if sentence_buffer.strip():
                                 await queue.put({
                                     'type': 'translate',
@@ -59,7 +122,6 @@ async def stream_api1(prompt: str, queue: asyncio.Queue):
                             content = parsed['choices'][0]['delta'].get('content', '')
                             
                             if content:
-                                # Send original text immediately
                                 await queue.put({
                                     'type': 'original',
                                     'text': content
@@ -67,7 +129,6 @@ async def stream_api1(prompt: str, queue: asyncio.Queue):
                                 
                                 sentence_buffer += content
                                 
-                                # When we have a complete sentence, send for translation
                                 if any(punct in content for punct in ['.', '!', '?', '\n']):
                                     if sentence_buffer.strip():
                                         await queue.put({
@@ -79,18 +140,23 @@ async def stream_api1(prompt: str, queue: asyncio.Queue):
                                         
                         except json.JSONDecodeError:
                             pass
-    
-    except Exception as e:
-        await queue.put({'error': str(e)})
-    finally:
-        await queue.put(None)  # Signal completion
+        
+        except asyncio.TimeoutError:
+            logger.error(f"[{request_id}] API1 timeout")
+            await queue.put({'error': 'Request timeout'})
+        except Exception as e:
+            logger.error(f"[{request_id}] API1 error: {str(e)}")
+            await queue.put({'error': str(e)})
+        finally:
+            await queue.put(None)
+            logger.info(f"[{request_id}] API1 stream completed")
 
 
-async def translate_text(text: str, target_language: str):
-    """Translate text using streaming API"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            async with client.stream(
+async def translate_text(text: str, target_language: str, request_id: str):
+    """Translate text with semaphore control"""
+    async with api_semaphore:  # Limit concurrent API calls
+        try:
+            async with http_client.stream(
                 'POST',
                 'https://api.openai.com/v1/chat/completions',
                 headers={
@@ -106,7 +172,8 @@ async def translate_text(text: str, target_language: str):
                         },
                         {'role': 'user', 'content': text}
                     ],
-                    'stream': True
+                    'stream': True,
+                    'max_tokens': 200
                 }
             ) as response:
                 if response.status_code != 200:
@@ -129,72 +196,105 @@ async def translate_text(text: str, target_language: str):
                                 
                         except json.JSONDecodeError:
                             pass
-    
-    except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Translation timeout'})}\n\n"
+        except Exception as e:
+            logger.error(f"[{request_id}] Translation error: {str(e)}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
 
-async def real_time_translation_pipeline(prompt: str, target_language: str):
-    """Main pipeline that coordinates both APIs"""
+async def real_time_translation_pipeline(prompt: str, target_language: str, request_id: str):
+    """Main pipeline with proper error handling"""
+    queue = asyncio.Queue(maxsize=100)  # Limit queue size
     
-    queue = asyncio.Queue()
-    
-    # Start API1 in background task
-    api1_task = asyncio.create_task(stream_api1(prompt, queue))
+    api1_task = asyncio.create_task(stream_api1(prompt, queue, request_id))
     
     try:
         while True:
-            chunk = await queue.get()
-            
-            if chunk is None:  # End signal
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                break
-            
-            if 'error' in chunk:
-                yield f"data: {json.dumps({'type': 'error', 'message': chunk['error']})}\n\n"
-                continue
-            
-            if chunk['type'] == 'original':
-                # Stream original text immediately
-                yield f"data: {json.dumps({'type': 'original', 'text': chunk['text']})}\n\n"
-            
-            elif chunk['type'] == 'translate':
-                # Stream translation
-                async for translation_chunk in translate_text(chunk['text'], target_language):
-                    yield translation_chunk
+            try:
+                # Wait for chunk with timeout
+                chunk = await asyncio.wait_for(queue.get(), timeout=REQUEST_TIMEOUT)
                 
-                # Add separator after each sentence
-                if not chunk.get('is_final'):
-                    yield f"data: {json.dumps({'type': 'separator'})}\n\n"
+                if chunk is None:
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    break
+                
+                if 'error' in chunk:
+                    yield f"data: {json.dumps({'type': 'error', 'message': chunk['error']})}\n\n"
+                    break
+                
+                if chunk['type'] == 'original':
+                    yield f"data: {json.dumps({'type': 'original', 'text': chunk['text']})}\n\n"
+                
+                elif chunk['type'] == 'translate':
+                    async for translation_chunk in translate_text(chunk['text'], target_language, request_id):
+                        yield translation_chunk
+                    
+                    if not chunk.get('is_final'):
+                        yield f"data: {json.dumps({'type': 'separator'})}\n\n"
+            
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timeout'})}\n\n"
+                break
         
         await api1_task
     
     except Exception as e:
+        logger.error(f"[{request_id}] Pipeline error: {str(e)}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
 
 @app.post("/translate-stream")
-async def translate_stream(request: TranslationRequest):
+async def translate_stream(request: Request, translation_request: TranslationRequest):
     """
-    Stream endpoint for real-time translation
+    Stream endpoint with rate limiting and concurrent request handling
+    """
+    client_ip = request.client.host
+    request_id = f"{client_ip}-{int(time.time()*1000)}"
     
-    Example curl:
-    curl -N -X POST http://localhost:8000/translate-stream \
-      -H "Content-Type: application/json" \
-      -d '{"prompt": "Tell me a story about a robot", "language": "Hindi"}'
-    """
+    # Check rate limit
+    if not check_rate_limit(client_ip):
+        logger.warning(f"[{request_id}] Rate limit exceeded for {client_ip}")
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please try again later."
+        )
+    
+    # Validate input
+    if len(translation_request.prompt) > 1000:
+        raise HTTPException(status_code=400, detail="Prompt too long (max 1000 characters)")
+    
+    logger.info(f"[{request_id}] New translation request from {client_ip}")
+    
     return StreamingResponse(
-        real_time_translation_pipeline(request.prompt, request.language),
+        real_time_translation_pipeline(
+            translation_request.prompt,
+            translation_request.language,
+            request_id
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
         }
     )
 
 
+@app.get("/health")
+async def health():
+    """Health check with stats"""
+    return {
+        "status": "ok",
+        "active_connections": len(rate_limit_tracker),
+        "max_concurrent": MAX_CONCURRENT_REQUESTS
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    # Same HTML as before
     return '''
     <!DOCTYPE html>
     <html>
@@ -224,6 +324,7 @@ async def index():
                 border-radius: 4px;
             }
             button:hover { background: #1d4ed8; }
+            button:disabled { background: #94a3b8; cursor: not-allowed; }
             input, select { 
                 padding: 10px; 
                 margin-right: 10px;
@@ -233,10 +334,19 @@ async def index():
             }
             #prompt { width: 400px; }
             .controls { margin-bottom: 20px; }
+            .status { 
+                margin-top: 10px; 
+                padding: 10px; 
+                background: #e0f2fe; 
+                border-radius: 4px;
+                display: none;
+            }
         </style>
     </head>
     <body>
         <h1>🌐 Real-time Streaming Translation</h1>
+        
+        <div class="status" id="status"></div>
         
         <div class="controls">
             <input type="text" id="prompt" placeholder="Enter your prompt" 
@@ -247,9 +357,8 @@ async def index():
                 <option value="German">German</option>
                 <option value="Japanese">Japanese</option>
                 <option value="Hindi">Hindi</option>
-                <option value="Chinese">Chinese</option>
             </select>
-            <button onclick="startStream()">Start Translation</button>
+            <button id="startBtn" onclick="startStream()">Start Translation</button>
             <button onclick="clearOutput()" style="background: #6b7280;">Clear</button>
         </div>
         
@@ -265,20 +374,38 @@ async def index():
         </div>
         
         <script>
+            function showStatus(message, type = 'info') {
+                const statusDiv = document.getElementById('status');
+                statusDiv.textContent = message;
+                statusDiv.style.display = 'block';
+                statusDiv.style.background = type === 'error' ? '#fee2e2' : '#e0f2fe';
+            }
+            
+            function hideStatus() {
+                document.getElementById('status').style.display = 'none';
+            }
+            
             function clearOutput() {
                 document.getElementById('original').innerHTML = '';
                 document.getElementById('translation').innerHTML = '';
+                hideStatus();
             }
             
             function startStream() {
                 clearOutput();
                 
+                const startBtn = document.getElementById('startBtn');
                 const prompt = document.getElementById('prompt').value;
                 const language = document.getElementById('language').value;
                 const originalDiv = document.getElementById('original');
                 const translationDiv = document.getElementById('translation');
                 
                 document.getElementById('targetLang').textContent = language;
+                
+                // Disable button during request
+                startBtn.disabled = true;
+                startBtn.textContent = 'Processing...';
+                showStatus('Connecting to translation service...');
                 
                 fetch('/translate-stream', {
                     method: 'POST',
@@ -291,12 +418,26 @@ async def index():
                     })
                 })
                 .then(response => {
+                    if (response.status === 429) {
+                        throw new Error('Rate limit exceeded. Please wait a minute.');
+                    }
+                    if (!response.ok) {
+                        throw new Error('Server error: ' + response.status);
+                    }
+                    
+                    showStatus('Streaming in progress...');
+                    
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     
                     function read() {
                         reader.read().then(({ done, value }) => {
-                            if (done) return;
+                            if (done) {
+                                startBtn.disabled = false;
+                                startBtn.textContent = 'Start Translation';
+                                hideStatus();
+                                return;
+                            }
                             
                             const text = decoder.decode(value);
                             const lines = text.split('\\n');
@@ -328,9 +469,12 @@ async def index():
                                             p.style.color = '#16a34a';
                                             originalDiv.appendChild(p.cloneNode(true));
                                             translationDiv.appendChild(p);
+                                            hideStatus();
                                         }
                                         else if (data.type === 'error') {
-                                            alert('❌ Error: ' + data.message);
+                                            showStatus('Error: ' + data.message, 'error');
+                                            startBtn.disabled = false;
+                                            startBtn.textContent = 'Start Translation';
                                         }
                                     } catch (e) {
                                         // Skip parse errors
@@ -347,7 +491,9 @@ async def index():
                     read();
                 })
                 .catch(error => {
-                    alert('❌ Error: ' + error.message);
+                    showStatus(error.message, 'error');
+                    startBtn.disabled = false;
+                    startBtn.textContent = 'Start Translation';
                 });
             }
         </script>
@@ -356,12 +502,13 @@ async def index():
     '''
 
 
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {"status": "ok"}
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use multiple workers for production
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=4,  # Multiple worker processes
+        log_level="info"
+    )
